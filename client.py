@@ -1,8 +1,11 @@
 import socket
 import sys
+from hashlib import sha256
 from Crypto.PublicKey import RSA
 from Crypto.Random import get_random_bytes
 from Crypto.Cipher import PKCS1_OAEP, AES
+from ecdsa import VerifyingKey, SigningKey, NIST256p, BadSignatureError
+from ecdsa.util import sigencode_der, sigdecode_der
 
 SERVER_RSA = None
 PORT_FOR_BOB = 15_000
@@ -13,6 +16,10 @@ def create_my_name(sc):
     name = ''
     global SERVER_RSA
     userKeys = RSA.generate(1024)
+
+    privateECDSA = SigningKey.generate(curve=NIST256p)
+    publicECDSA = privateECDSA.verifying_key
+    print('Public ECDSA', publicECDSA)
 
     userKeysDER = userKeys.exportKey('DER')
     sc.send(userKeysDER)
@@ -25,15 +32,14 @@ def create_my_name(sc):
         name = input(sc.recv(1024).decode())
         sc.send(name.encode())
         flagName = (sc.recv(1024).decode() == 'True')
-    return name, userRSA
+    return name, userRSA, privateECDSA, publicECDSA
 
 
 def print_operations():
     print("Options:")
-    print("\t Enter 'quit' or 'q' to exit")
-    # print("\t Enter 'list' or 'l' to list established secure users")
-    print("\t Enter 'connect' or 'c' to start conversation")
-    print("\t Enter 'wait connection' or 'w' to wait connection")
+    print("\t Enter 'q' to exit")
+    print("\t Enter 'connect' or 'c' to be Alice")
+    print("\t Enter 'wait connection' or 'w' to be Bob")
 
 
 def print_user_list(client):
@@ -47,7 +53,7 @@ def string_padding(string):
 
 # Alice  C option
 
-def initiate_connection(client, UserName):
+def initiate_connection(client, UserName, publicECDSA):
     flagRecipient = False
     recipient_name = ''
 
@@ -100,7 +106,7 @@ def initiate_connection(client, UserName):
     B = string_without_padding(E_a_decr[:20].decode())
     K = E_a_decr[20:36]
     R_a_check = E_a_decr[36:]
-    if R_a_check != R_a_check:
+    if R_a_check != R_a:
         print('ERROR!!! Message spoofing!')
         sys.exit()
     print('Alice B', B)
@@ -128,9 +134,16 @@ def initiate_connection(client, UserName):
 
     print('************************** COMMON KEY K = ', K, ' **************************')
 
+    connection_to_Bob.send(publicECDSA.to_der())
+    mes = connection_to_Bob.recv(1024)
+    BobECDSA = VerifyingKey.from_der(mes)
+    print('Bob ECDSA pub', BobECDSA)
+
+
     K_COMMON = K
 
-    return K_COMMON, connection_to_Bob
+    return K_COMMON, connection_to_Bob, BobECDSA
+
 
 def string_without_padding(string):
     pos = string.find('0')
@@ -139,7 +152,7 @@ def string_without_padding(string):
 
 #  Bob    W option
 
-def connect_to_user(server_connect, userRSA, myUserName):  # bob side
+def connect_to_user(server_connect, userRSA, myUserName, publicECDSA):  # bob side
     clientSocket = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
     HOSTNAME = socket.gethostname()
     HOST_IP = socket.gethostbyname(HOSTNAME)
@@ -152,7 +165,7 @@ def connect_to_user(server_connect, userRSA, myUserName):  # bob side
     Client_to_Alice, address = clientSocket.accept()
 
     # YAH step 1: Bob <--{A, R_a}-- Alice
-    mes = Client_to_Alice.recv(28)
+    mes = Client_to_Alice.recv(1024)
     Client_to_Alice.send('ACK'.encode())
     print('Bob message ', mes)
     A = string_without_padding(mes[:20].decode())
@@ -190,8 +203,7 @@ def connect_to_user(server_connect, userRSA, myUserName):  # bob side
     print('Bob R_b', R_b)
 
     E_k = Client_to_Alice.recv(1024)
-    # message = nonce_to_Bob + tag_to_bob + ciphertext
-    # E_k_decr = AEScipher.
+
     nonce = E_k[:16]
     AEScipher = AES.new(K, AES.MODE_GCM, nonce=nonce)
     tag = E_k[16:32]
@@ -204,13 +216,18 @@ def connect_to_user(server_connect, userRSA, myUserName):  # bob side
 
     print('************************** COMMON KEY K = ', K, ' **************************')
 
+    mes = Client_to_Alice.recv(1024)
+    Client_to_Alice.send(publicECDSA.to_der())
+    AliceECDSA = VerifyingKey.from_der(mes)
+    print('Alice ECDSA pub', AliceECDSA)
+
+
     K_COMMON = K
 
-    print('OK2')
-    return K_COMMON, Client_to_Alice
+    return K_COMMON, Client_to_Alice, AliceECDSA
 
 
-def messenger_for_alice(K_sym, connect_to_bob, userName):
+def messenger_for_alice(K_sym, Bob_socket, userName, privateECDSA, publicBobECDSA):
     flagExit = False
     while not flagExit:
         message = input('ENTER YOUR MESSAGE: ')
@@ -223,13 +240,41 @@ def messenger_for_alice(K_sym, connect_to_bob, userName):
         nonce_alice = AEScipher.nonce
         cipher, tag_alice = AEScipher.encrypt_and_digest(bytes(message, 'ascii'))
         message_enc = nonce_alice + tag_alice + cipher
-        connect_to_bob.send(message_enc)
+        Bob_socket.send(message_enc)
+        if Bob_socket.recv(12).decode() != 'ACK':
+            sys.exit()
+
+        sig = privateECDSA.sign_deterministic(
+            message_enc,
+            hashfunc=sha256,
+            sigencode=sigencode_der
+        )
+        print('Alice signed ECDSA', sig)
+        Bob_socket.send(sig)
+
+
         # __________________________
         if not flagExit:
-            cipher_from_bob = connect_to_bob.recv(2048)
-            nonce_bob = cipher_from_bob[:16]
-            tag_bob = cipher_from_bob[16:32]
-            cipher_mb = cipher_from_bob[32:]
+            ciphertext_from_Bob = Bob_socket.recv(2048)
+
+            Bob_socket.send('ACK'.encode())
+
+            signature = Bob_socket.recv(1024)
+            print('Bob ECDSA signature', signature)
+
+            try:
+                ret = publicBobECDSA.verify(signature, ciphertext_from_Bob, sha256, sigdecode=sigdecode_der)
+                assert ret
+                print("Valid signature")
+            except BadSignatureError:
+                print("Incorrect signature")
+                sys.exit()
+
+
+
+            nonce_bob = ciphertext_from_Bob[:16]
+            tag_bob = ciphertext_from_Bob[16:32]
+            cipher_mb = ciphertext_from_Bob[32:]
             AEScipher = AES.new(K_sym, AES.MODE_GCM, nonce=nonce_bob)
             message_from_bob = AEScipher.decrypt(cipher_mb).decode()
             try:
@@ -242,15 +287,30 @@ def messenger_for_alice(K_sym, connect_to_bob, userName):
                 flagExit = True
 
 
-def messenger_for_bob(K_sym, connect_to_alice, userName):
+def messenger_for_bob(K_sym, Alice_socket, userName, privateECDSA, publicAliceECDSA):
     flagExit = False
     print('Waiting for ', userName, ' to start conversation....')
     while not flagExit:
-        cipher_to_alice = connect_to_alice.recv(2048)
+        cipher_text_from_Alice = Alice_socket.recv(2048)
 
-        nonce_alice = cipher_to_alice[:16]
-        tag_alice = cipher_to_alice[16:32]
-        cipher_ma = cipher_to_alice[32:]
+        Alice_socket.send('ACK'.encode())
+
+        signature = Alice_socket.recv(1024)
+        print('Alice ECDSA signature', signature)
+
+        print('Alice pub ECDSA', publicAliceECDSA)
+        try:
+            ret = publicAliceECDSA.verify(signature, cipher_text_from_Alice, sha256, sigdecode=sigdecode_der)
+            assert ret
+            print("Valid signature")
+        except BadSignatureError:
+            print("Incorrect signature")
+            sys.exit()
+
+
+        nonce_alice = cipher_text_from_Alice[:16]
+        tag_alice = cipher_text_from_Alice[16:32]
+        cipher_ma = cipher_text_from_Alice[32:]
         AEScipher = AES.new(K_sym, AES.MODE_GCM, nonce=nonce_alice)
         message_from_alice = AEScipher.decrypt(cipher_ma).decode()
         try:
@@ -260,6 +320,9 @@ def messenger_for_bob(K_sym, connect_to_alice, userName):
         if message_from_alice.find('quit') != -1:
             break
         print(message_from_alice)
+
+
+
         # _________________________
         message = input('ENTER YOUR MESSAGE: ')
         if message == 'quit':
@@ -269,7 +332,21 @@ def messenger_for_bob(K_sym, connect_to_alice, userName):
         AEScipher = AES.new(K_sym, AES.MODE_GCM)
         nonce_bob = AEScipher.nonce
         cipher, tag_bob = AEScipher.encrypt_and_digest(bytes(message, 'ascii'))
-        connect_to_alice.send(nonce_bob + tag_bob + cipher)
+        cipher_text_from_Bob = nonce_bob + tag_bob + cipher
+        Alice_socket.send(cipher_text_from_Bob)
+
+        if Alice_socket.recv(12).decode() != 'ACK':
+            sys.exit()
+
+        sig = privateECDSA.sign_deterministic(
+            cipher_text_from_Bob,
+            hashfunc=sha256,
+            sigencode=sigencode_der
+        )
+        print('Bob signed ECDSA', sig)
+        Alice_socket.send(sig)
+
+
 
 
 if __name__ == '__main__':
@@ -281,8 +358,7 @@ if __name__ == '__main__':
 
     client.connect((SERVER_IP, PORT))
 
-
-    client_name, userRSA = create_my_name(client)
+    client_name, userRSA, privateECDSA, publicECDSA = create_my_name(client)
     print('Welcome, ', client_name, '\n')
     #########
 
@@ -298,16 +374,16 @@ if __name__ == '__main__':
         ###
         elif operation.lower() == 'connect' or operation.lower() == 'c':
             client.send(operation.lower()[0].encode())
-            K_sym, connect_to_bob = initiate_connection(client, client_name)
-            messenger_for_alice(K_sym, connect_to_bob, client_name)
+            K_sym, connect_to_bob, BobECDSA = initiate_connection(client, client_name, publicECDSA)
+            messenger_for_alice(K_sym, connect_to_bob, client_name, privateECDSA, BobECDSA)
             operation = 'quit'
             break
         ###
         elif operation.lower() == 'wait connection' or operation.lower() == 'w':
             client.send(operation.lower()[0].encode())
             print(client.recv(1024).decode())
-            K_sym, connect_to_alice = connect_to_user(client, userRSA, client_name)
-            messenger_for_bob(K_sym, connect_to_alice, client_name)
+            K_sym, connect_to_alice, AliceECDSA = connect_to_user(client, userRSA, client_name, publicECDSA)
+            messenger_for_bob(K_sym, connect_to_alice, client_name, privateECDSA, AliceECDSA)
             operation = 'quit'
             break
 
